@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"runtime"
 	"sort"
@@ -25,7 +27,10 @@ import (
 	"golang.org/x/net/http2"
 
 	"github.com/fatih/color"
+	"github.com/vansante/go-ffprobe"
 )
+
+const ffBinPath = "ffprobe"
 
 const (
 	httpsTemplate = `` +
@@ -439,6 +444,67 @@ func getFilenameFromHeaders(headers http.Header) string {
 	return ""
 }
 
+func runFFProbe() (io.WriteCloser, chan *ffprobe.ProbeData, error) {
+	cmd := exec.Command(
+		ffBinPath,
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_format",
+		"-show_streams",
+		"-",
+	)
+	pipe, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	ret := make(chan *ffprobe.ProbeData)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+
+		// var outputBuf bytes.Buffer
+		// cmd.Stdout = &outputBuf
+
+		outputBuf, err := cmd.CombinedOutput()
+		// if err == exec.ErrNotFound {
+		// 	// return nil, ffprobe.ErrBinNotFound
+		// 	ret <- nil
+		// } else if err != nil {
+		// 	panic(err)
+		// }
+		if err != nil {
+			panic(err)
+		}
+
+		// done := make(chan error, 1)
+		// go func() {
+		// 	done <- cmd.Wait()
+		// }()
+
+		select {
+		case <-ctx.Done():
+			err = cmd.Process.Kill()
+			if err == nil {
+				// return nil, ffprobe.ErrTimeout
+				// ret <- nil
+				panic("timeout")
+			}
+			// case err = <-done:
+			// 	if err != nil {
+			// 		panic(err)
+			// 	}
+		}
+
+		data := &ffprobe.ProbeData{}
+		err = json.Unmarshal(outputBuf, data)
+		if err != nil {
+			panic(err)
+		}
+		ret <- data
+	}()
+	return pipe, ret, nil
+}
+
 // readResponseBody consumes the body of the response.
 // readResponseBody returns an informational message about the
 // disposition of the response body's contents.
@@ -447,7 +513,13 @@ func readResponseBody(req *http.Request, resp *http.Response) string {
 		return ""
 	}
 
-	w := ioutil.Discard
+	dw := ioutil.Discard
+	var w io.WriteCloser
+	w, res, err := runFFProbe()
+	if err != nil {
+		panic(err)
+	}
+
 	msg := color.CyanString("Body discarded")
 
 	if saveOutput || outputFile != "" {
@@ -474,10 +546,124 @@ func readResponseBody(req *http.Request, resp *http.Response) string {
 		msg = color.CyanString("Body read")
 	}
 
-	if _, err := io.Copy(w, resp.Body); err != nil && w != ioutil.Discard {
-		log.Fatalf("failed to read response body: %v", err)
+	var written, chunkWritten int64
+	var duration, chunkDuration time.Duration
+	var speedChunks []float64
+	// if _, err := io.Copy(w, resp.Body); err != nil && w != ioutil.Discard {
+	// 	log.Fatalf("failed to read response body: %v", err)
+	// }
+	size := 32 * 1024
+	src := resp.Body.(io.Reader)
+	if l, ok := src.(*io.LimitedReader); ok && int64(size) > l.N {
+		if l.N < 1 {
+			size = 1
+		} else {
+			size = int(l.N)
+		}
 	}
 
+	respSize, _ := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+	progCellSize := respSize / 120
+	cellsCount := int64(1)
+
+	buf := make([]byte, size)
+	c := 0
+
+	var (
+		out           io.Writer
+		probeData     *ffprobe.ProbeData
+		probeReceived bool
+		rate, speed   float64
+		bufEvents     int
+	)
+
+	out = w
+	printf("[%v]\n ", strings.Repeat("_", 120))
+
+	for {
+		if !probeReceived {
+			select {
+			case probeData = <-res:
+				if probeData != nil {
+					vRate, err := strconv.Atoi(probeData.GetFirstVideoStream().BitRate)
+					if err != nil {
+						panic(err)
+					}
+					aRate, err := strconv.Atoi(probeData.GetFirstAudioStream().BitRate)
+					if err != nil {
+						panic(err)
+					}
+					rate = float64(vRate + aRate)
+				} else {
+					printf("failed to read bitrate data\n")
+				}
+				probeReceived = true
+			default:
+			}
+		}
+
+		t := time.Now()
+		nr, rErr := src.Read(buf)
+		if nr > 0 {
+			nw, ew := out.Write(buf[0:nr])
+			written += int64(nw)
+			chunkWritten += int64(nw)
+			if ew != nil {
+				// err := ew
+				out = dw
+				nw, _ = out.Write(buf[nw:nr])
+				written += int64(nw)
+				chunkWritten += int64(nw)
+			}
+			if nr != nw {
+				// err = ErrShortWrite
+				panic(ew)
+			}
+
+		}
+		if rErr != nil {
+			if rErr != io.EOF {
+				fmt.Println(rErr)
+			}
+			w.Close()
+			break
+		}
+		duration += time.Since(t)
+		chunkDuration += time.Since(t)
+		c++
+		if c == 30 {
+			speed = float64(chunkWritten) / chunkDuration.Seconds()
+
+			speedChunks = append(speedChunks, speed)
+			chunkWritten = 0
+			chunkDuration = 0
+			c = 0
+		}
+		if written >= progCellSize*cellsCount {
+			if rate == 0 {
+				printf("ˇ")
+			} else if rate > speed {
+				printf("z")
+			} else {
+				printf("|")
+			}
+			cellsCount++
+		}
+	}
+
+	for _, chunk := range speedChunks {
+		if rate > chunk {
+			bufEvents++
+		}
+	}
+
+	printf("\n\ndownloaded %v in %vs\n", written/1024/1024, duration.Seconds())
+	printf(
+		"video bitrate: %.2fMB/s, download speed: %.2fMB/s, %v stutters\n",
+		rate/1024/1024,
+		float64(written)/duration.Seconds()/1024/1024,
+		bufEvents)
+	printf("video codec: %v, audio codec: %v\n", probeData.GetFirstVideoStream().CodecLongName, probeData.GetFirstAudioStream().CodecLongName)
 	return msg
 }
 
